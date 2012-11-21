@@ -16,6 +16,7 @@ import (
     "regexp"
     "runtime"
     "time"
+    urllib "net/url"
     "database/sql"
     "github.com/vmihailenco/redis"
     _ "github.com/bmizerany/pq"
@@ -31,7 +32,8 @@ type Config struct {Redis RedisConfig; Postgres PostgresConfig; Scraper ScraperC
 
 var (
     // regex is case-insensitive and counts newlines in `.`
-    titleRegex = regexp.MustCompile("(?is)<title>([^<>]+)</title>")
+    titleRegex = regexp.MustCompile("(?is)<title\\s*(?:[A-Za-z]+=[\"'][A-Za-z0-9_ -]+[\"'])?>([^<]+)</title>")
+    metaEquiv = regexp.MustCompile("(?is)<meta\\s+http-equiv=[\"']?refresh[\"']?\\s+.+url=\\s*([^\"']+)")
     charsetRegex = regexp.MustCompile("(?i)charset=([A-Za-z0-9-]+)")
 
     numCPU = int(math.Max(float64(runtime.NumCPU()), 4))
@@ -169,6 +171,39 @@ func fetchTitle(bodyText string) string {
     return ""
 }
 
+func fetchMetaRedirect(bodyText string, url string) string {
+    if bodyText != "" {
+        matches := metaEquiv.FindStringSubmatch(bodyText)
+        if matches != nil {
+            uri,err := urllib.Parse(matches[1])
+            if err != nil {
+                log.Println("URL_ERROR cannot parse", matches[1])
+                return ""
+            }
+
+            if uri.Host != "" {
+                // redirect url is fully qualified
+                return matches[1]
+            } else {
+                // needs stitching
+                origUri,err := urllib.Parse(url)
+                if err != nil {
+                    log.Println("URL_ERROR cannot parse", matches[1])
+                    return ""
+                }
+
+                uri.Host = origUri.Host
+                uri.Scheme = origUri.Scheme
+                if !strings.HasPrefix(uri.Path, "/") {
+                    uri.Path = "/" + uri.Path
+                }
+                return uri.String()
+            }
+        }
+    }
+    return ""
+}
+
 func fetchCharset(header string) string {
     if header != "" {
         matches := charsetRegex.FindStringSubmatch(header)
@@ -207,7 +242,12 @@ func fetchTitleJob(url string) {
                 }
             }
         } else {
-            log.Println("TITLE_ERROR title_not_found", url)
+            metaRefreshUrl := fetchMetaRedirect(bodyText, url)
+            if metaRefreshUrl == "" {
+                log.Println("TITLE_ERROR title_not_found", url)
+            } else {
+                fetchTitleJob(metaRefreshUrl)
+            }
         }
     }
 
@@ -245,7 +285,7 @@ func main() {
     }
 
     log.Printf("Starting with %d processes\n", numCPU)
-    runtime.GOMAXPROCS(1)
+    runtime.GOMAXPROCS(numCPU)
 
     conn := getRedisConn()
 
